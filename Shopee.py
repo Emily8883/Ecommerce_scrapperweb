@@ -847,11 +847,68 @@ class Shopee:
         return "No description available"  # Return default message when description is not found
 
 
+    def _resolve_cdn_to_local(self, img_url: str) -> Optional[str]:
+        """
+        Maps a Shopee image URL (CDN URL or local relative path) to the highest-quality
+        locally available file from the extracted zip's images directory.
+        Strips any resize suffix to derive the base file ID, then returns the largest
+        matching file in html_dir/images/ to ensure full-resolution output.
+
+        The zip archiver saves images as local relative paths using the pattern
+        "./images/file_br-...-resize_w<N>_nl.<ext>", so both CDN (@resize) and local
+        (-resize) suffix formats are handled.
+
+        :param img_url: CDN URL or local relative path for the image (may include a resize suffix)
+        :return: Relative path like "images/file_br-....jpg" for use by download_single_image, or None if not found
+        """
+
+        if not self.local_html_path:  # Verify that local mode is active
+            return None  # Not in local mode, cannot resolve to a local file
+
+        html_dir = os.path.dirname(os.path.abspath(self.local_html_path))  # Get directory of the local HTML file
+        local_images_dir = os.path.join(html_dir, "images")  # Path to images subdirectory within the extracted zip
+
+        if not os.path.isdir(local_images_dir):  # Verify that the local images directory exists
+            return None  # Images directory absent, cannot resolve locally
+
+        if img_url.startswith(("http://", "https://")):  # CDN URL: derive base ID by stripping @resize suffix
+            clean_url = re.sub(r'@resize_w\d+_nl(?:\.webp)?', '', img_url)  # Remove CDN resize suffix
+            parsed = urlparse(clean_url)  # Parse cleaned URL to extract path component
+            url_path = parsed.path  # e.g. /file/br-11134207-7r98o-ma2u1w5m58n693
+            expected_basename = url_path.lstrip('/').replace('/', '_')  # e.g. file_br-11134207-7r98o-ma2u1w5m58n693
+        else:  # Local relative path e.g. ./images/file_br-...-resize_w82_nl.jpg (written by the zip archiver)
+            local_fname = os.path.basename(img_url)  # file_br-11134207-7r98o-ma2u1w5m58n693-resize_w82_nl.jpg
+            fname_no_ext = os.path.splitext(local_fname)[0]  # file_br-11134207-7r98o-ma2u1w5m58n693-resize_w82_nl
+            expected_basename = re.sub(r'-resize_w\d+_nl(?:\.webp)?$', '', fname_no_ext)  # file_br-11134207-7r98o-ma2u1w5m58n693
+
+        if not expected_basename:  # Guard against empty derived basename
+            return None  # Cannot search without a valid base file name
+
+        candidates: List[tuple] = []  # Collect all matching files to pick the largest
+
+        for fname in os.listdir(local_images_dir):  # Iterate all entries in the local images directory
+            if not os.path.isfile(os.path.join(local_images_dir, fname)):  # Skip non-file entries
+                continue  # Continue past subdirectories
+            fname_no_prefix = re.sub(r'^\d+_', '', fname)  # Strip any numeric sort prefix that may have been applied
+            fname_base = os.path.splitext(fname_no_prefix)[0]  # Remove extension to compare bare basenames
+            if fname_base == expected_basename:  # Exact match on the full-resolution base name (no resize suffix)
+                local_path = os.path.join(local_images_dir, fname)  # Build full local filesystem path
+                file_size = os.path.getsize(local_path)  # Read file size to prefer largest variant
+                if file_size > 0:  # Skip empty files
+                    candidates.append((file_size, os.path.join("images", fname)))  # Record (size, relative_path)
+
+        if candidates:  # At least one matching file was found
+            candidates.sort(key=lambda x: x[0], reverse=True)  # Sort by size descending to pick highest quality
+            return candidates[0][1]  # Return relative path to the largest (full-resolution) matching file
+
+        return None  # No matching local file found for this image URL
+
+
     def find_image_urls(self, soup: BeautifulSoup) -> List[str]:
         """
         Finds all image URLs from the product gallery (class="airUhU").
         Extracts full-size images from thumbnail containers (class="UBG7wZ").
-        Removes resize parameters (@resize_w82_nl, @resize_w164_nl) to get original images.
+        Replaces resize parameters with @resize_w900_nl to get the highest available resolution.
         
         :param soup: BeautifulSoup object containing the parsed HTML
         :return: List of image URLs
@@ -896,8 +953,11 @@ class Shopee:
                                 img_url = src
                         
                         if img_url:  # If we found a URL
-                            import re
-                            img_url = re.sub(r'@resize_w\d+_nl', '', img_url)
+                            local_path = self._resolve_cdn_to_local(img_url)  # Attempt to resolve CDN URL to a local file from the extracted zip
+                            if local_path:  # If a matching local file was found in the extracted zip's images directory
+                                img_url = local_path  # Use the local file path for reliable offline copying
+                            else:  # No local file found, fall back to high-resolution HTTP download
+                                img_url = re.sub(r'@resize_w\d+_nl', '@resize_w900_nl', img_url)  # Replace any resize suffix with 900px to get the highest available resolution
                             
                             if img_url.startswith("/file/"):  # Relative path
                                 img_url = f"https://down-br.img.susercontent.com{img_url}"
@@ -916,7 +976,49 @@ class Shopee:
                 verbose_output(  # Log gallery not found
                     f"{BackgroundColors.YELLOW}Gallery container (class='airUhU') not found.{Style.RESET_ALL}"
                 )  # End of verbose output call
-        
+
+            for display_div in soup.find_all("div", class_="UdI7e2"):  # Main display containers alongside the gallery
+                if not isinstance(display_div, Tag):  # Ensure element is a BeautifulSoup Tag
+                    continue  # Skip non-Tag elements
+
+                display_img = display_div.find("img", class_="uXN1L5")
+
+                if display_img and isinstance(display_img, Tag):  # Verify image tag was found
+                    srcset = display_img.get("srcset")
+                    img_url = None
+
+                    if srcset and isinstance(srcset, str):  # Prefer srcset for accurate URL
+                        srcset_parts = srcset.split(",")  # Split srcset entries by comma
+                        if srcset_parts:  # Ensure at least one entry exists
+                            first_url = srcset_parts[0].strip().split()[0]  # Take URL portion from first entry
+                            img_url = first_url
+
+                    if not img_url:  # Fall back to src / data-src when srcset is absent
+                        src = display_img.get("src") or display_img.get("data-src")
+                        if src and isinstance(src, str):  # Verify attribute value is a non-empty string
+                            img_url = src
+
+                    if img_url:  # Proceed if a URL was obtained
+                        local_path = self._resolve_cdn_to_local(img_url)  # Resolve to full-resolution local file
+                        if local_path:  # Full-resolution local file found in the extracted zip
+                            img_url = local_path  # Use local path for reliable offline copying
+                        else:  # Local file absent; attempt high-resolution HTTP fallback
+                            img_url = re.sub(r'@resize_w\d+_nl', '@resize_w900_nl', img_url)  # Upgrade to 900px
+
+                        if img_url.startswith("/file/"):  # Bare relative CDN path
+                            img_url = f"https://down-br.img.susercontent.com{img_url}"
+
+                        if ("placeholder" not in img_url.lower() and
+                            "loading" not in img_url.lower() and
+                            img_url not in seen_urls):  # Verify not a placeholder and not already queued
+
+                            image_urls.append(img_url)  # Add main display image to results
+                            seen_urls.add(img_url)  # Track URL to prevent later duplication
+
+                            verbose_output(  # Log main display image URL
+                                f"{BackgroundColors.GREEN}Found main display image: {BackgroundColors.CYAN}{img_url[:100]}{Style.RESET_ALL}"
+                            )  # End of verbose output call
+
         except Exception as e:  # Catch any exceptions during image extraction
             print(f"{BackgroundColors.RED}Error finding images: {e}{Style.RESET_ALL}")  # Alert user about error
         
