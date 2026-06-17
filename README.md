@@ -709,20 +709,4 @@ Please follow the guidelines in [CONTRIBUTING.md](CONTRIBUTING.md) for detailed 
    - Push changes: `git push origin feature/YourFeatureName`
    - Open a Pull Request with detailed description
 
-## Collaborators
-
-We thank the following people who contributed to this project:
-
-<table>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/BrenoFariasdaSilva" title="Breno Farias da Silva">
-        <img src="https://github.com/BrenoFariasdaSilva.png" width="100px;" alt="Breno Farias da Silva Profile Picture"/><br>
-        <sub>
-          <b>Breno Farias da Silva</b>
-        </sub>
-      </a>
-    </td>
-  </tr>
-</table>
 
